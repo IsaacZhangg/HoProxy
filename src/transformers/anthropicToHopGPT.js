@@ -1,8 +1,13 @@
 import crypto from 'node:crypto';
-import { v4 as uuidv4 } from 'uuid';
 import { loggers } from '../utils/logger.js';
-import { isThinkingModel } from './hopGPTToAnthropic.js';
+import {
+  isThinkingModel,
+  normalizeMaxTokens,
+  normalizeStopSequences,
+} from './sharedTransformUtils.js';
 import { prepareMessagesForThinking } from './thinkingUtils.js';
+
+export { normalizeMaxTokens, normalizeStopSequences } from './sharedTransformUtils.js';
 
 const log = loggers.transform;
 
@@ -743,26 +748,8 @@ export function normalizeSystemPrompt(system) {
   return null;
 }
 
-export function normalizeMaxTokens(value) {
-  if (!Number.isFinite(value)) {
-    return null;
-  }
-  const intValue = Math.floor(value);
-  return intValue > 0 ? intValue : null;
-}
-
 function normalizeFiniteNumber(value) {
   return Number.isFinite(value) ? value : null;
-}
-
-export function normalizeStopSequences(value) {
-  if (Array.isArray(value)) {
-    return value.filter((seq) => typeof seq === 'string' && seq.length > 0);
-  }
-  if (typeof value === 'string' && value.length > 0) {
-    return [value];
-  }
-  return [];
 }
 
 export function extractThinkingConfig(anthropicRequest) {
@@ -1015,7 +1002,7 @@ export function transformAnthropicToHopGPT(anthropicRequest, conversationState =
     clientTimestamp,
     isCreatedByUser: true,
     parentMessageId,
-    messageId: uuidv4(),
+    messageId: crypto.randomUUID(),
     error: false,
     endpoint: 'AnthropicClaude',
     endpointType: 'custom',

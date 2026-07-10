@@ -94,9 +94,11 @@ router.get('/models', (_req, res) => {
   });
 });
 
-router.get('/models/*', (req, res) => {
+router.get('/models/*modelId', (req, res) => {
   // Handle model IDs that may contain slashes (e.g., anthropic/claude-opus-4-5)
-  const rawId = req.params[0];
+  const rawId = Array.isArray(req.params.modelId)
+    ? req.params.modelId.join('/')
+    : req.params.modelId;
   const requestedId = stripProviderPrefix(rawId);
   let model = AVAILABLE_MODELS.find((m) => m.id === requestedId);
 

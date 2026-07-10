@@ -821,6 +821,6 @@ describe('POST /v1/messages streaming — end-to-end', () => {
     expect(res.headers['content-type']).not.toMatch(/text\/event-stream/);
     expect(res.body?.type).toBe('error');
     expect(res.body?.error?.type).toBe('authentication_error');
-    expect(res.body?.error?.message).toMatch(/Refresh token expired/);
+    expect(res.body?.error?.message).toBe('HopGPT authentication expired; run bun run extract');
   });
 });

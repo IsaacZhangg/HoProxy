@@ -64,7 +64,7 @@ describe('POST /v1/messages non-streaming — missing final event', () => {
       });
 
     expect(res.status).toBe(502);
-    expect(res.body?.error?.message).toMatch(/Stream ended without final event/);
+    expect(res.body?.error?.message).toBe('Upstream HopGPT request failed');
   });
 
   it('returns 200 with complete content when the SSE stream ends with final:true', async () => {

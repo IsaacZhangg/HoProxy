@@ -1,16 +1,38 @@
+import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import puppeteer from 'puppeteer-extra';
-import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 
 const HOPGPT_URL = 'https://chat.ai.jh.edu';
 const USER_PATH = '/api/user';
 const CONFIG_PATH = '/api/config';
 const REFRESH_PATH = '/api/auth/refresh';
 
-puppeteer.use(StealthPlugin());
+let browserLibrariesPromise;
+
+async function loadBrowserLibraries() {
+  if (!browserLibrariesPromise) {
+    browserLibrariesPromise = Promise.all([
+      import('puppeteer-extra'),
+      import('puppeteer-extra-plugin-stealth'),
+    ])
+      .then(([puppeteerModule, stealthModule]) => {
+        const puppeteer = puppeteerModule.default;
+        const StealthPlugin = stealthModule.default;
+        puppeteer.use(StealthPlugin());
+        return puppeteer;
+      })
+      .catch((error) => {
+        browserLibrariesPromise = null;
+        throw new Error(
+          `Browser extraction dependencies are unavailable. Run "bun install" with optional dependencies enabled. (${error.message})`,
+        );
+      });
+  }
+  return browserLibrariesPromise;
+}
 
 async function launchBrowser(options = {}) {
+  const puppeteer = await loadBrowserLibraries();
   const launchOptions = {
     headless: false,
     defaultViewport: null,
@@ -64,32 +86,38 @@ export async function extractCredentials(options = {}) {
 
   const browser = await launchBrowser(options);
   let bearerToken = null;
+  let page = null;
+  let timeoutId = null;
+  let requestHandler = null;
+  let responseHandler = null;
+  let disconnectedHandler = null;
 
   try {
-    const page = await browser.newPage();
+    page = await browser.newPage();
 
     // request events observe traffic without enabling Puppeteer's interception mode.
-    page.on('request', (request) => {
+    requestHandler = (request) => {
       const url = request.url();
       if (!url.startsWith(`${HOPGPT_URL}/api/`)) return;
       const auth = request.headers().authorization;
       if (auth?.startsWith('Bearer ')) {
         bearerToken = auth.slice('Bearer '.length);
       }
-    });
+    };
+    page.on('request', requestHandler);
 
     const loginDetected = new Promise((resolve) => {
-      const handler = (response) => {
+      responseHandler = (response) => {
         if (isLoginSignal(response)) {
-          page.off('response', handler);
+          page.off('response', responseHandler);
           resolve({ reason: 'api-signal', url: response.url() });
         }
       };
-      page.on('response', handler);
+      page.on('response', responseHandler);
     });
 
-    const timeoutPromise = new Promise((_, reject) =>
-      setTimeout(
+    const timeoutPromise = new Promise((_, reject) => {
+      timeoutId = setTimeout(
         () =>
           reject(
             new Error(
@@ -97,13 +125,12 @@ export async function extractCredentials(options = {}) {
             ),
           ),
         timeout,
-      ),
-    );
+      );
+    });
 
     const disconnectedPromise = new Promise((_, reject) => {
-      browser.on('disconnected', () =>
-        reject(new Error('Browser was closed before login completed.')),
-      );
+      disconnectedHandler = () => reject(new Error('Browser was closed before login completed.'));
+      browser.on('disconnected', disconnectedHandler);
     });
 
     await page.goto(HOPGPT_URL, { waitUntil: 'networkidle2' });
@@ -173,7 +200,7 @@ export async function extractCredentials(options = {}) {
       throw new Error(
         `Logged in but openid_user_id cookie was not set. ` +
           `See diagnostic above for visible cookies. ` +
-          `Try signing out of HopGPT in all browser tabs and re-running \`npm run extract\`.`,
+          `Try signing out of HopGPT in all browser tabs and re-running \`bun run extract\`.`,
       );
     }
     if (!credentials.cookies.connect_sid && !credentials.cookies.refreshToken) {
@@ -181,7 +208,7 @@ export async function extractCredentials(options = {}) {
         `Logged in but no HopGPT refresh credential was set. ` +
           `Automatic refresh needs the connect.sid session cookie` +
           ` (or legacy refreshToken cookie when present). ` +
-          `Try signing out of HopGPT in all browser tabs and re-running \`npm run extract\`.`,
+          `Try signing out of HopGPT in all browser tabs and re-running \`bun run extract\`.`,
       );
     }
 
@@ -208,6 +235,16 @@ export async function extractCredentials(options = {}) {
 
     return credentials;
   } finally {
+    clearTimeout(timeoutId);
+    if (page && requestHandler) {
+      page.off('request', requestHandler);
+    }
+    if (page && responseHandler) {
+      page.off('response', responseHandler);
+    }
+    if (disconnectedHandler) {
+      browser.off('disconnected', disconnectedHandler);
+    }
     await browser.close().catch(() => {});
   }
 }
@@ -336,7 +373,24 @@ export function writeEnvFile(envPath, newContent) {
     finalContent = `${newContent}\n# Other configuration\n${preservedLines.join('\n')}\n`;
   }
 
-  fs.writeFileSync(envPath, finalContent);
+  const temporaryPath = path.join(
+    path.dirname(envPath),
+    `.${path.basename(envPath)}.${process.pid}.${randomUUID()}.tmp`,
+  );
+  try {
+    fs.writeFileSync(temporaryPath, finalContent, {
+      encoding: 'utf8',
+      mode: 0o600,
+      flag: 'wx',
+    });
+    fs.renameSync(temporaryPath, envPath);
+    fs.chmodSync(envPath, 0o600);
+  } catch (error) {
+    try {
+      fs.unlinkSync(temporaryPath);
+    } catch (_cleanupError) {}
+    throw error;
+  }
 }
 
 export default { extractCredentials };

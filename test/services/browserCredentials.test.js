@@ -1,6 +1,6 @@
-import fs from 'fs';
-import os from 'os';
-import path from 'path';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import {
   generateEnvContent,
@@ -94,6 +94,7 @@ describe('writeEnvFile', () => {
       expect(written).toContain('HOPGPT_COOKIE_OPENID_USER_ID=fresh');
       expect(written).not.toContain('HOPGPT_COOKIE_REFRESH_TOKEN=stale');
       expect(written).toContain('UNRELATED_VAR=keep-me');
+      expect(fs.statSync(envPath).mode & 0o777).toBe(0o600);
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }

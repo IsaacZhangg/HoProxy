@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
 import path from 'node:path';
 import { extractCredentials } from './services/browserCredentials.js';
 
@@ -19,7 +19,7 @@ HopGPT Credential Extraction
 Extracts credentials from a live browser session by observing the post-login
 /api/auth/refresh or /api/config call. Writes them to .env.
 
-Usage: npm run extract [-- options]
+Usage: bun run extract [-- options]
 
 Options:
   --env-path <path>    Path to .env file (default: .env in project root)
@@ -31,9 +31,9 @@ Environment:
   HOPGPT_PUPPETEER_USER_DATA_DIR Chrome user data directory (optional)
 
 Example:
-  npm run extract
-  npm run extract -- --timeout 600
-  npm run extract -- --env-path /path/to/.env
+  bun run extract
+  bun run extract -- --timeout 600
+  bun run extract -- --env-path /path/to/.env
 `);
     process.exit(0);
   }
@@ -41,7 +41,7 @@ Example:
 
 extractCredentials(options)
   .then(() => {
-    console.log('\nYou can now start the proxy server with: npm start\n');
+    console.log('\nYou can now start the proxy server with: bun run start\n');
     process.exit(0);
   })
   .catch((error) => {

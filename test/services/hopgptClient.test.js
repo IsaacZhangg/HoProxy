@@ -29,6 +29,23 @@ function createMockTLSResponse({
   };
 }
 
+function createFetchResponse(response) {
+  const body = response.body || '';
+  return {
+    ok: response.ok,
+    status: response.status,
+    statusText: response.statusText,
+    headers: new Headers(response.headers),
+    body: new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(body));
+        controller.close();
+      },
+    }),
+    text: async () => body,
+  };
+}
+
 function restoreEnv(name, value) {
   if (value === undefined) {
     delete process.env[name];
@@ -100,6 +117,14 @@ describe('HopGPTClient', () => {
   beforeEach(() => {
     // Mock tlsFetch instead of global fetch
     tlsFetchSpy = vi.spyOn(tlsClient, 'tlsFetch');
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (url, options = {}) => {
+      const response = await tlsFetchSpy({
+        url: String(url),
+        method: options.method || 'GET',
+        headers: options.headers || {},
+      });
+      return createFetchResponse(response);
+    });
     originalProactiveRefreshBuffer = process.env.HOPGPT_PROACTIVE_REFRESH_BUFFER_SECONDS;
     originalTokenProvider = process.env.HOPGPT_COOKIE_TOKEN_PROVIDER;
     originalBunTest = process.env.BUN_TEST;
@@ -351,7 +376,7 @@ describe('HopGPTClient', () => {
       bearerToken: 'old-token', // Non-JWT triggers proactive refresh
       connectSid: 'session-id',
       openidUserId: 'openid-id',
-      streamingTransport: 'tls',
+      streamingTransport: 'fetch',
     });
 
     const response = await client.sendMessage({ text: 'hello' });
@@ -510,7 +535,7 @@ describe('HopGPTClient', () => {
         openidUserId: 'openid-id',
         rateLimitMaxRetries: 3,
         rateLimitBaseDelayMs: 10, // Use short delay for tests
-        streamingTransport: 'tls',
+        streamingTransport: 'fetch',
       });
       const sleepSpy = vi.spyOn(client, '_sleep').mockResolvedValue();
 
@@ -557,7 +582,7 @@ describe('HopGPTClient', () => {
         openidUserId: 'openid-id',
         rateLimitMaxRetries: 2,
         rateLimitBaseDelayMs: 10,
-        streamingTransport: 'tls',
+        streamingTransport: 'fetch',
       });
       const sleepSpy = vi.spyOn(client, '_sleep').mockResolvedValue();
 
@@ -611,7 +636,7 @@ describe('HopGPTClient', () => {
         openidUserId: 'openid-id',
         rateLimitMaxRetries: 3,
         rateLimitMaxWaitTimeMs: 10000, // 10 seconds max
-        streamingTransport: 'tls',
+        streamingTransport: 'fetch',
       });
 
       // With Retry-After=60s exceeding maxWaitTimeMs=10s, sendMessage rethrows
@@ -764,7 +789,7 @@ describe('HopGPTClient', () => {
         connectSid: 'valid-session',
         openidUserId: 'valid-openid',
         autoPersist: false,
-        streamingTransport: 'tls',
+        streamingTransport: 'fetch',
       });
 
       await expect(client.sendMessage({ text: 'hello' })).rejects.toThrow(TokenRefreshError);
@@ -987,7 +1012,7 @@ describe('HopGPTClient', () => {
         bearerToken: 'token',
         connectSid: 's',
         openidUserId: 'o',
-        streamingTransport: 'tls',
+        streamingTransport: 'fetch',
         autoRefresh: true,
         autoPersist: false,
       });
@@ -1035,7 +1060,7 @@ describe('HopGPTClient', () => {
         bearerToken: 'token',
         connectSid: 's',
         openidUserId: 'o',
-        streamingTransport: 'tls',
+        streamingTransport: 'fetch',
         autoRefresh: true,
         autoPersist: false,
       });
@@ -1095,7 +1120,7 @@ describe('HopGPTClient', () => {
         bearerToken: 'token',
         connectSid: 's',
         openidUserId: 'o',
-        streamingTransport: 'tls',
+        streamingTransport: 'fetch',
         autoPersist: false,
         rateLimitMaxRetries: 2,
         rateLimitBaseDelayMs: 10,
@@ -1142,7 +1167,7 @@ describe('HopGPTClient', () => {
         bearerToken: 'token',
         connectSid: 's',
         openidUserId: 'o',
-        streamingTransport: 'tls',
+        streamingTransport: 'fetch',
         autoPersist: false,
         rateLimitMaxRetries: 2,
         rateLimitBaseDelayMs: 10,
@@ -1200,7 +1225,7 @@ describe('HopGPTClient', () => {
         bearerToken: 'token',
         connectSid: 's',
         openidUserId: 'o',
-        streamingTransport: 'tls',
+        streamingTransport: 'fetch',
         autoPersist: false,
         rateLimitMaxRetries: 2,
         rateLimitBaseDelayMs: 10,
@@ -1251,7 +1276,7 @@ describe('HopGPTClient', () => {
         bearerToken: 'token',
         connectSid: 's',
         openidUserId: 'o',
-        streamingTransport: 'tls',
+        streamingTransport: 'fetch',
         autoRefresh: true,
         autoPersist: false,
       });
@@ -1288,7 +1313,7 @@ describe('HopGPTClient', () => {
         bearerToken: 'token',
         connectSid: 's',
         openidUserId: 'o',
-        streamingTransport: 'tls',
+        streamingTransport: 'fetch',
         autoPersist: false,
       });
       await expect(
@@ -1321,7 +1346,7 @@ describe('HopGPTClient', () => {
         bearerToken: 'token',
         connectSid: 's',
         openidUserId: 'o',
-        streamingTransport: 'tls',
+        streamingTransport: 'fetch',
         autoPersist: false,
       });
       await expect(client.sendMessage({ text: 'hi' })).rejects.toMatchObject({
@@ -1363,7 +1388,7 @@ describe('HopGPTClient', () => {
         bearerToken: 'token',
         connectSid: 's',
         openidUserId: 'o',
-        streamingTransport: 'tls',
+        streamingTransport: 'fetch',
         autoPersist: false,
       });
       await expect(client.sendMessage({ text: 'hi' })).rejects.toMatchObject({
@@ -1403,7 +1428,7 @@ describe('HopGPTClient', () => {
         bearerToken: 'token',
         connectSid: 's',
         openidUserId: 'o',
-        streamingTransport: 'tls',
+        streamingTransport: 'fetch',
         autoPersist: false,
       });
       const response = await client.sendMessage({ text: 'hi' });
@@ -1441,7 +1466,7 @@ describe('HopGPTClient', () => {
         bearerToken: 'token',
         connectSid: 's',
         openidUserId: 'o',
-        streamingTransport: 'tls',
+        streamingTransport: 'fetch',
         autoPersist: false,
       });
       await client.sendMessage({ text: 'hi' });

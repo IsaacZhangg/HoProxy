@@ -1,3 +1,4 @@
+import { EventEmitter } from 'node:events';
 import { describe, expect, it } from 'vitest';
 import { parseSSEStream, pipeSSEStream } from '../../src/utils/sseParser.js';
 import { createSseResponse } from '../helpers/sse.js';
@@ -33,5 +34,41 @@ describe('sseParser utilities', () => {
     const output = writes.join('');
     expect(output).toContain('event: proxy');
     expect(output).toContain('data: {"original":"{\\"foo\\":\\"bar\\"}"}');
+  });
+
+  it('enforces an idle deadline on stalled upstream streams', async () => {
+    const response = {
+      body: new ReadableStream({
+        start() {},
+      }),
+    };
+    await expect(parseSSEStream(response, () => {}, { idleTimeoutMs: 10 })).rejects.toMatchObject({
+      name: 'TimeoutError',
+      message: 'Upstream stream was idle for too long',
+    });
+  });
+
+  it('waits for response backpressure before writing more events', async () => {
+    const response = createSseResponse(
+      'event: message\ndata: {"first":true}\n\n' + 'event: message\ndata: {"second":true}\n\n',
+    );
+    const res = new EventEmitter();
+    const writes = [];
+    res.writableEnded = false;
+    res.destroyed = false;
+    res.write = (chunk) => {
+      writes.push(chunk);
+      if (writes.length === 1) {
+        queueMicrotask(() => res.emit('drain'));
+        return false;
+      }
+      return true;
+    };
+
+    await pipeSSEStream(response, res, (event) => ({
+      event: 'proxy',
+      data: JSON.parse(event.data),
+    }));
+    expect(writes).toHaveLength(2);
   });
 });

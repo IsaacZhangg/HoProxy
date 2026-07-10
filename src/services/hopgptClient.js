@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import {
@@ -24,6 +25,24 @@ function maskToken(token) {
 
 function configOrEnv(configValue, envValue) {
   return configValue === undefined ? envValue : configValue;
+}
+
+function writePrivateFileAtomic(filePath, content) {
+  const directory = path.dirname(filePath);
+  const temporaryPath = path.join(
+    directory,
+    `.${path.basename(filePath)}.${process.pid}.${randomUUID()}.tmp`,
+  );
+  try {
+    fs.writeFileSync(temporaryPath, content, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+    fs.renameSync(temporaryPath, filePath);
+    fs.chmodSync(filePath, 0o600);
+  } catch (error) {
+    try {
+      fs.unlinkSync(temporaryPath);
+    } catch (_cleanupError) {}
+    throw error;
+  }
 }
 
 function resolveTokenProvider(configTokenProvider, openidUserId) {
@@ -59,6 +78,43 @@ function isTestRuntime() {
   );
 }
 
+function createAbortError(message) {
+  const error = new Error(message);
+  error.name = 'AbortError';
+  return error;
+}
+
+function createTimeoutError(message) {
+  const error = new Error(message);
+  error.name = 'TimeoutError';
+  return error;
+}
+
+function createLinkedTimeoutSignal(parentSignal, timeoutMs) {
+  const controller = new AbortController();
+  const onAbort = () => {
+    controller.abort(parentSignal.reason || createAbortError('Request aborted'));
+  };
+  if (parentSignal?.aborted) {
+    onAbort();
+  } else {
+    parentSignal?.addEventListener('abort', onAbort, { once: true });
+  }
+
+  const timeout = setTimeout(() => {
+    controller.abort(createTimeoutError(`Upstream connection timed out after ${timeoutMs}ms`));
+  }, timeoutMs);
+  timeout.unref?.();
+
+  return {
+    signal: controller.signal,
+    cleanup() {
+      clearTimeout(timeout);
+      parentSignal?.removeEventListener('abort', onAbort);
+    },
+  };
+}
+
 export class HopGPTClient {
   constructor(config = {}) {
     this.baseURL = config.baseURL || 'https://chat.ai.jh.edu';
@@ -85,6 +141,10 @@ export class HopGPTClient {
       process.env.HOPGPT_STREAMING_TRANSPORT ||
       'fetch'
     ).toLowerCase();
+    this.connectTimeoutMs = parsePositiveInteger(
+      config.connectTimeoutMs ?? process.env.HOPROXY_UPSTREAM_CONNECT_TIMEOUT_MS,
+      30_000,
+    );
     this.refreshPromise = null;
     this.proactiveRefreshBufferSec = parsePositiveInteger(
       config.proactiveRefreshBufferSec ?? process.env.HOPGPT_PROACTIVE_REFRESH_BUFFER_SECONDS,
@@ -162,8 +222,22 @@ export class HopGPTClient {
     return Math.round(delay);
   }
 
-  async _sleep(ms) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
+  async _sleep(ms, signal) {
+    if (signal?.aborted) {
+      throw signal.reason || createAbortError('Request aborted');
+    }
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        signal?.removeEventListener('abort', onAbort);
+        resolve();
+      }, ms);
+      timer.unref?.();
+      const onAbort = () => {
+        clearTimeout(timer);
+        reject(signal.reason || createAbortError('Request aborted'));
+      };
+      signal?.addEventListener('abort', onAbort, { once: true });
+    });
   }
 
   _resolveBrowserType() {
@@ -383,7 +457,7 @@ export class HopGPTClient {
           finalContent += '\n';
         }
 
-        fs.writeFileSync(this.envPath, finalContent);
+        writePrivateFileAtomic(this.envPath, finalContent);
 
         const verifyContent = fs.readFileSync(this.envPath, 'utf-8');
         const verifiedSid =
@@ -469,7 +543,7 @@ export class HopGPTClient {
 
     if (!this.hasRefreshCredential()) {
       log.error(
-        'No HopGPT refresh credential available — run: npm run extract to capture connect.sid/openid_user_id cookies',
+        'No HopGPT refresh credential available — run: bun run extract to capture connect.sid/openid_user_id cookies',
       );
       return false;
     }
@@ -636,12 +710,13 @@ export class HopGPTClient {
 
   _shouldUseFetchForStreaming() {
     if (this.streamingTransport === 'tls') {
-      return false;
+      throw new Error(
+        'HOPGPT_STREAMING_TRANSPORT=tls is no longer supported because it buffers SSE; use fetch',
+      );
     }
 
     if (typeof fetch !== 'function') {
-      log.debug('fetch not available, falling back to TLS client for streaming');
-      return false;
+      throw new Error('Native fetch is required for HopGPT streaming');
     }
 
     return true;
@@ -720,6 +795,8 @@ export class HopGPTClient {
       headers,
       body: hopGPTRequest,
       browserType,
+      signal: requestOptions.signal,
+      timeoutMs: requestOptions.connectTimeoutMs || this.connectTimeoutMs,
     });
 
     if (!response.ok) {
@@ -780,34 +857,20 @@ export class HopGPTClient {
 
     const url = `${this.baseURL}${this.streamEndpointPrefix}${encodeURIComponent(streamId)}`;
 
+    this._shouldUseFetchForStreaming();
+    const connectTimeout = createLinkedTimeoutSignal(
+      requestOptions.signal,
+      requestOptions.connectTimeoutMs || this.connectTimeoutMs,
+    );
     let response;
-    let usedFetch = false;
-
-    if (this._shouldUseFetchForStreaming()) {
-      try {
-        response = await fetch(url, {
-          method: 'GET',
-          headers: this._sanitizeHeadersForFetch(headers),
-          signal: requestOptions.signal,
-        });
-        usedFetch = true;
-      } catch (error) {
-        if (error?.name === 'AbortError') {
-          throw error;
-        }
-        log.debug('subscribeStream fetch failed, falling back to tlsFetch', {
-          error: error.message,
-        });
-      }
-    }
-
-    if (!usedFetch) {
-      response = await tlsFetch({
-        url,
+    try {
+      response = await fetch(url, {
         method: 'GET',
-        headers,
-        browserType,
+        headers: this._sanitizeHeadersForFetch(headers),
+        signal: connectTimeout.signal,
       });
+    } finally {
+      connectTimeout.cleanup();
     }
 
     if (!response.ok) {
@@ -832,13 +895,11 @@ export class HopGPTClient {
       );
     }
 
-    if (usedFetch) {
-      return response;
-    }
-    return this._createStreamResponse(response);
+    return response;
   }
 
   async sendMessage(hopGPTRequest, requestOptions = {}, retryState = {}) {
+    this._shouldUseFetchForStreaming();
     retryState = {
       isAuthRetry: false,
       rateLimitAttempt: 0,
@@ -858,6 +919,7 @@ export class HopGPTClient {
       if (!tokenValid) {
         throw new TokenRefreshError('Failed to obtain valid authentication token before request');
       }
+      requestOptions.onPhase?.('refresh');
     }
 
     const signal = requestOptions.signal;
@@ -866,12 +928,13 @@ export class HopGPTClient {
     let ack;
     try {
       ack = await this.startStream(hopGPTRequest, { signal });
+      requestOptions.onPhase?.('post_ack');
     } catch (error) {
       if (error instanceof HopGPTError && error.statusCode === 429) {
         const { rateLimitAttempt } = retryState;
         const retryAfterMs = error.retryAfterMs ?? null;
         log.warn('Rate limited on POST (pre-ack)', {
-          attempt: `${rateLimitAttempt + 1}/${this.rateLimitConfig.maxRetries}`,
+          attempt: `${rateLimitAttempt + 1}/${this.rateLimitConfig.maxRetries + 1}`,
           retryAfter: retryAfterMs !== null ? `${retryAfterMs}ms` : 'not specified',
         });
         if (retryAfterMs !== null && retryAfterMs > this.rateLimitConfig.maxWaitTimeMs) {
@@ -879,7 +942,7 @@ export class HopGPTClient {
         }
         if (rateLimitAttempt < this.rateLimitConfig.maxRetries) {
           const waitTime = this._calculateBackoffDelay(rateLimitAttempt, retryAfterMs);
-          await this._sleep(waitTime);
+          await this._sleep(waitTime, signal);
           return this.sendMessage(hopGPTRequest, requestOptions, {
             ...retryState,
             rateLimitAttempt: rateLimitAttempt + 1,
@@ -922,13 +985,15 @@ export class HopGPTClient {
   async _subscribeWithRetry(ack, requestOptions, retryState) {
     const signal = requestOptions.signal;
     try {
-      return await this.subscribeStream(ack.streamId, { signal });
+      const response = await this.subscribeStream(ack.streamId, { signal });
+      requestOptions.onPhase?.('stream_subscribe');
+      return response;
     } catch (error) {
       if (error instanceof HopGPTError && error.statusCode === 429) {
         const attempt = retryState.postAckRateLimitAttempt;
         const retryAfterMs = error.retryAfterMs ?? null;
         log.warn('Rate limited on GET (post-ack)', {
-          attempt: `${attempt + 1}/${this.rateLimitConfig.maxRetries}`,
+          attempt: `${attempt + 1}/${this.rateLimitConfig.maxRetries + 1}`,
           retryAfter: retryAfterMs !== null ? `${retryAfterMs}ms` : 'not specified',
           streamId: ack.streamId,
         });
@@ -937,7 +1002,7 @@ export class HopGPTClient {
         }
         if (attempt < this.rateLimitConfig.maxRetries) {
           const waitTime = this._calculateBackoffDelay(attempt, retryAfterMs);
-          await this._sleep(waitTime);
+          await this._sleep(waitTime, signal);
           return this._subscribeWithRetry(ack, requestOptions, {
             ...retryState,
             postAckRateLimitAttempt: attempt + 1,
@@ -975,27 +1040,24 @@ export class HopGPTClient {
     }
   }
 
-  _createStreamResponse(tlsResponse) {
-    const body = tlsResponse.body || '';
-
-    const stream = new ReadableStream({
-      start(controller) {
-        const encoder = new TextEncoder();
-        controller.enqueue(encoder.encode(body));
-        controller.close();
-      },
-    });
-
-    return {
-      ok: tlsResponse.ok,
-      status: tlsResponse.status,
-      statusText: tlsResponse.statusText,
-      headers: tlsResponse.headers,
-      body: stream,
-      _rawBody: body,
-      text: async () => body,
-      json: async () => JSON.parse(body),
-    };
+  async checkUpstreamReadiness({ signal, timeoutMs = 5_000 } = {}) {
+    const timeout = createLinkedTimeoutSignal(signal, timeoutMs);
+    try {
+      const response = await fetch(this.baseURL, {
+        method: 'HEAD',
+        headers: this._sanitizeHeadersForFetch(this.buildBrowserHeaders()),
+        signal: timeout.signal,
+        redirect: 'manual',
+      });
+      return {
+        reachable: response.status > 0 && response.status < 500,
+        status: response.status,
+      };
+    } catch (error) {
+      return { reachable: false, error: error.name || 'network_error' };
+    } finally {
+      timeout.cleanup();
+    }
   }
 
   validateAuth() {

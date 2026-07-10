@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import { loadConfig } from '../config.js';
 import {
   AuthError,
   CloudflareBlockedError,
@@ -6,6 +7,8 @@ import {
   RefreshTokenExpiredError,
   TokenRefreshError,
 } from '../errors/authErrors.js';
+import { validateMessagesRequest, validateSessionHeaders } from '../messageValidation.js';
+import { registerActiveStream } from '../services/activeStreams.js';
 import {
   getConversationState,
   rememberConversationTurn,
@@ -26,30 +29,38 @@ import { formatSSEEvent, HopGPTToAnthropicTransformer } from '../transformers/ho
 import { analyzeConversationState } from '../transformers/thinkingUtils.js';
 import { loggers } from '../utils/logger.js';
 import { resolveModelMapping, stripProviderPrefix } from '../utils/modelMapping.js';
+import { createRequestTimings } from '../utils/requestTimings.js';
 import { parseSSEStream, pipeSSEStream } from '../utils/sseParser.js';
+import { estimateInputTokens } from '../utils/tokenEstimate.js';
 
 const log = loggers.messages;
 const router = Router();
-const DEFAULT_STREAM_IDLE_PING_DELAY_MS = 250;
-const DEFAULT_TOOL_BATCH_IDLE_CLOSE_MS = 100;
+const DEFAULT_TOOL_BATCH_IDLE_CLOSE_MS = 500;
 
-router.post('/messages/count_tokens', (_req, res) => {
-  res.status(501).json({
-    type: 'error',
-    error: {
-      type: 'not_implemented',
-      message:
-        'Token counting is not implemented. Use /v1/messages and configure your client to skip token counting.',
-    },
-  });
+router.post('/messages/count_tokens', (req, res) => {
+  const request = { ...req.body, max_tokens: req.body?.max_tokens ?? 1 };
+  const validationError =
+    validateMessagesRequest(request, req.app.locals.config) ||
+    validateSessionHeaders(req, req.app.locals.config);
+  if (validationError) {
+    return res.status(400).json({
+      type: 'error',
+      error: { type: 'invalid_request_error', message: validationError },
+    });
+  }
+  return res.json({ input_tokens: estimateInputTokens(request) });
 });
 
 router.post('/messages', async (req, res) => {
+  const timings = createRequestTimings(log, req.id);
   try {
     const anthropicRequest = req.body;
 
-    const validationError = validateRequest(anthropicRequest);
+    const validationError =
+      validateMessagesRequest(anthropicRequest, req.app.locals.config) ||
+      validateSessionHeaders(req, req.app.locals.config);
     if (validationError) {
+      timings.finish('validation_error');
       return res.status(400).json({
         type: 'error',
         error: {
@@ -58,11 +69,13 @@ router.post('/messages', async (req, res) => {
         },
       });
     }
+    timings.mark('validation');
 
     const client = getDefaultClient();
 
     const authValidation = client.validateAuth();
     if (!authValidation.valid) {
+      timings.finish('authentication_error');
       return res.status(401).json({
         type: 'error',
         error: {
@@ -71,6 +84,7 @@ router.post('/messages', async (req, res) => {
         },
       });
     }
+    timings.mark('authentication');
 
     if (authValidation.warnings?.length > 0) {
       authValidation.warnings.forEach((warning) => log.warn(warning));
@@ -84,7 +98,7 @@ router.post('/messages', async (req, res) => {
     }
 
     const resetRequested = shouldResetConversation(req, anthropicRequest);
-    const { sessionId } = resolveSessionId(req, anthropicRequest, {
+    const { sessionId, clientNamespace } = resolveSessionId(req, anthropicRequest, {
       allowTranscriptMatch: !resetRequested,
     });
     res.setHeader('X-Session-Id', sessionId);
@@ -97,7 +111,7 @@ router.post('/messages', async (req, res) => {
     const requestConversationState = normalizeConversationState(
       anthropicRequest.conversation_state || anthropicRequest.conversationState,
     );
-    const conversationState = mergeConversationStates(
+    const conversationState = resolveRequestConversationState(
       storedConversationState,
       requestConversationState,
     );
@@ -110,6 +124,7 @@ router.post('/messages', async (req, res) => {
     if (modelMapping.modelDisplayLabel) {
       hopGPTRequest.modelDisplayLabel = modelMapping.modelDisplayLabel;
     }
+    timings.mark('transformation');
 
     // GPT-5.5 runs on HopGPT's AzureOpenAI endpoint, a reasoning model with a
     // fixed parameter set. Reshape the Claude-shaped body into the exact wire
@@ -195,7 +210,9 @@ router.post('/messages', async (req, res) => {
         res,
         req,
         sessionId,
+        clientNamespace,
         anthropicRequest,
+        timings,
       );
     } else {
       await handleNonStreamingRequest(
@@ -203,11 +220,17 @@ router.post('/messages', async (req, res) => {
         hopGPTRequest,
         transformer,
         res,
+        req,
         sessionId,
+        clientNamespace,
         anthropicRequest,
+        timings,
       );
     }
+    timings.mark('completion');
+    timings.finish('success');
   } catch (error) {
+    timings.finish('error');
     handleError(error, res);
   }
 });
@@ -217,9 +240,11 @@ async function handleStreamingRequest(
   hopGPTRequest,
   transformer,
   res,
-  _req,
+  req,
   sessionId,
+  clientNamespace,
   anthropicRequest,
+  timings,
 ) {
   // Stage SSE headers but do NOT flush them yet. If sendMessage() throws before
   // any HopGPT byte arrives (expired creds, Cloudflare block, network error),
@@ -236,7 +261,13 @@ async function handleStreamingRequest(
   });
 
   const abortController = new AbortController();
+  const unregisterStream = registerActiveStream(abortController);
   let clientDisconnected = false;
+  const config = req.app.locals.config || loadConfig();
+  const totalTimer = setTimeout(() => {
+    abortController.abort(createTimeoutError('Upstream request exceeded its total deadline'));
+  }, config.upstreamTotalTimeoutMs);
+  totalTimer.unref?.();
 
   // Listen for client disconnect to abort upstream request
   // NOTE: Must use res.on('close'), NOT req.on('close')
@@ -254,18 +285,15 @@ async function handleStreamingRequest(
   res.on('close', onClose);
 
   let hopGPTResponse;
-  const idlePingTimer = setTimeout(() => {
-    if (!clientDisconnected && !res.writableEnded && !res.destroyed) {
-      writeSSEEvents(res, transformer.createMessageStart());
-    }
-  }, getStreamIdlePingDelayMs());
   try {
     hopGPTResponse = await client.sendMessage(hopGPTRequest, {
       stream: true,
       signal: abortController.signal,
+      onPhase: (phase) => timings.mark(phase),
     });
   } catch (error) {
-    clearTimeout(idlePingTimer);
+    clearTimeout(totalTimer);
+    unregisterStream();
     // Pre-stream failure — headers not yet flushed, so we can return a proper
     // HTTP error response via the shared error handler.
     res.removeListener('close', onClose);
@@ -296,13 +324,11 @@ async function handleStreamingRequest(
     res.removeHeader('Cache-Control');
     res.removeHeader('Connection');
     res.removeHeader('X-Accel-Buffering');
-    handleError(error, res);
-    return;
+    throw error;
   }
-  clearTimeout(idlePingTimer);
 
   try {
-    writeSSEEvents(res, transformer.createMessageStart());
+    await writeSSEEvents(res, transformer.createMessageStart());
 
     const pipeResult = await pipeSSEStream(
       hopGPTResponse,
@@ -315,8 +341,15 @@ async function handleStreamingRequest(
         autoEndOnMessageStop: true,
         onToolUseIdle: () => transformer.forceEnd(),
         toolUseIdleCloseMs: getToolBatchIdleCloseMs(),
+        idleTimeoutMs: config.upstreamIdleTimeoutMs,
+        totalTimeoutMs: config.upstreamTotalTimeoutMs,
+        onFirstByte: () => timings.mark('first_byte'),
+        onToolClose: () => timings.mark('tool_close'),
       },
     );
+    if (!pipeResult?.stoppedOnMessageStop && abortController.signal.aborted) {
+      throw abortController.signal.reason || new Error('Upstream request aborted');
+    }
     if (pipeResult?.stoppedOnMessageStop && !abortController.signal.aborted) {
       abortController.abort();
     }
@@ -331,7 +364,14 @@ async function handleStreamingRequest(
     }
 
     // Update state before ending the response so fast follow-up requests see it.
-    persistConversationTurn(sessionId, anthropicRequest, transformer, null, hopGPTRequest);
+    persistConversationTurn(
+      sessionId,
+      clientNamespace,
+      anthropicRequest,
+      transformer,
+      null,
+      hopGPTRequest,
+    );
 
     if (!clientDisconnected && !res.writableEnded) {
       res.end();
@@ -353,20 +393,17 @@ async function handleStreamingRequest(
         type: 'error',
         error: {
           type: 'api_error',
-          message: error.message,
+          message: error?.name === 'TimeoutError' ? error.message : 'Upstream stream failed',
         },
       },
     };
     res.write(formatSSEEvent(errorEvent));
     res.end();
   } finally {
+    clearTimeout(totalTimer);
+    unregisterStream();
     res.removeListener('close', onClose);
   }
-}
-
-function getStreamIdlePingDelayMs() {
-  const parsed = Number.parseInt(process.env.HOPGPT_STREAM_IDLE_PING_DELAY_MS ?? '', 10);
-  return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_STREAM_IDLE_PING_DELAY_MS;
 }
 
 function getToolBatchIdleCloseMs() {
@@ -374,9 +411,11 @@ function getToolBatchIdleCloseMs() {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_TOOL_BATCH_IDLE_CLOSE_MS;
 }
 
-function writeSSEEvents(res, events) {
+async function writeSSEEvents(res, events) {
   for (const event of events) {
-    res.write(formatSSEEvent(event));
+    if (!res.write(formatSSEEvent(event))) {
+      await new Promise((resolve) => res.once('drain', resolve));
+    }
   }
   if (events.length > 0 && typeof res.flush === 'function') {
     res.flush();
@@ -388,34 +427,76 @@ async function handleNonStreamingRequest(
   hopGPTRequest,
   transformer,
   res,
+  req,
   sessionId,
+  clientNamespace,
   anthropicRequest,
+  timings,
 ) {
   log.debug('Starting non-streaming response', {
     sessionId: `${sessionId.slice(0, 8)}...`,
   });
-  const hopGPTResponse = await client.sendMessage(hopGPTRequest, {
-    stream: false,
-  });
+  const abortController = new AbortController();
+  const unregisterStream = registerActiveStream(abortController);
+  const config = req.app.locals.config || loadConfig();
+  const totalTimer = setTimeout(() => {
+    abortController.abort(createTimeoutError('Upstream request exceeded its total deadline'));
+  }, config.upstreamTotalTimeoutMs);
+  totalTimer.unref?.();
+  const onClose = () => {
+    if (!res.writableEnded) {
+      abortController.abort(new Error('Client disconnected'));
+    }
+  };
+  res.on('close', onClose);
 
-  await parseSSEStream(hopGPTResponse, (event) => {
-    transformer.transformEvent(event);
-  });
+  try {
+    const hopGPTResponse = await client.sendMessage(hopGPTRequest, {
+      stream: false,
+      signal: abortController.signal,
+      onPhase: (phase) => timings.mark(phase),
+    });
 
-  // Require final:true. If the stream ended without it, HopGPT gave us an
-  // incomplete response — fail loudly instead of emitting empty content.
-  if (!transformer.hasEnded()) {
-    throw new HopGPTError(502, 'Stream ended without final event', null);
+    await parseSSEStream(
+      hopGPTResponse,
+      (event) => {
+        transformer.transformEvent(event);
+      },
+      {
+        signal: abortController.signal,
+        idleTimeoutMs: config.upstreamIdleTimeoutMs,
+        totalTimeoutMs: config.upstreamTotalTimeoutMs,
+        onFirstByte: () => timings.mark('first_byte'),
+      },
+    );
+
+    if (abortController.signal.aborted) {
+      throw abortController.signal.reason || new Error('Upstream request aborted');
+    }
+    if (!transformer.hasEnded()) {
+      throw new HopGPTError(502, 'Stream ended without final event', null);
+    }
+
+    const response = transformer.buildNonStreamingResponse();
+    persistConversationTurn(
+      sessionId,
+      clientNamespace,
+      anthropicRequest,
+      transformer,
+      response,
+      hopGPTRequest,
+    );
+    res.json(response);
+  } finally {
+    clearTimeout(totalTimer);
+    unregisterStream();
+    res.removeListener('close', onClose);
   }
-
-  const response = transformer.buildNonStreamingResponse();
-  // Update state before sending the response so fast follow-up requests see it.
-  persistConversationTurn(sessionId, anthropicRequest, transformer, response, hopGPTRequest);
-  res.json(response);
 }
 
 function persistConversationTurn(
   sessionId,
+  clientNamespace,
   anthropicRequest,
   transformer,
   response = null,
@@ -433,43 +514,16 @@ function persistConversationTurn(
   ) {
     updateConversationState(sessionId, nextState);
     const assistantContent = response?.content || transformer.getAssistantContentBlocks();
-    rememberConversationTurn(sessionId, anthropicRequest, {
-      role: 'assistant',
-      content: assistantContent || [],
-    });
+    rememberConversationTurn(
+      sessionId,
+      anthropicRequest,
+      {
+        role: 'assistant',
+        content: assistantContent || [],
+      },
+      clientNamespace,
+    );
   }
-}
-
-function validateRequest(request) {
-  if (!request.model) {
-    return 'model is required';
-  }
-
-  if (!request.messages || !Array.isArray(request.messages)) {
-    return 'messages array is required';
-  }
-
-  if (request.messages.length === 0) {
-    return 'messages array cannot be empty';
-  }
-
-  for (let i = 0; i < request.messages.length; i++) {
-    const msg = request.messages[i];
-
-    if (!msg.role) {
-      return `messages[${i}].role is required`;
-    }
-
-    if (!['user', 'assistant'].includes(msg.role)) {
-      return `messages[${i}].role must be 'user' or 'assistant'`;
-    }
-
-    if (msg.content === undefined || msg.content === null) {
-      return `messages[${i}].content is required`;
-    }
-  }
-
-  return null;
 }
 
 function normalizeConversationState(state) {
@@ -507,6 +561,34 @@ function mergeConversationStates(storedState, requestState) {
   };
 }
 
+function resolveRequestConversationState(storedState, requestState) {
+  if (!requestState) {
+    return storedState;
+  }
+
+  if (process.env.HOPROXY_TRUST_CLIENT_CONVERSATION_STATE === 'true') {
+    return mergeConversationStates(storedState, requestState);
+  }
+
+  if (!storedState) {
+    log.warn('Ignoring client conversation_state without server-owned session state');
+    return null;
+  }
+
+  const matchesConversation =
+    !requestState.conversationId || requestState.conversationId === storedState.conversationId;
+  const matchesMessage =
+    !requestState.lastAssistantMessageId ||
+    requestState.lastAssistantMessageId === storedState.lastAssistantMessageId;
+
+  if (!matchesConversation || !matchesMessage) {
+    log.warn('Ignoring client conversation_state that does not match server-owned state');
+    return storedState;
+  }
+
+  return storedState;
+}
+
 function handleError(error, res) {
   log.error('Request failed', {
     error: error.message,
@@ -521,6 +603,16 @@ function handleError(error, res) {
     return res.status(resolved.statusCode).json(resolved.payload);
   }
 
+  if (error?.name === 'TimeoutError') {
+    return res.status(504).json({
+      type: 'error',
+      error: {
+        type: 'api_error',
+        message: 'Upstream HopGPT request timed out',
+      },
+    });
+  }
+
   if (error instanceof HopGPTError) {
     const statusCode = error.statusCode >= 400 && error.statusCode < 600 ? error.statusCode : 502;
     const responseBody = typeof error.responseBody === 'string' ? error.responseBody : '';
@@ -530,6 +622,7 @@ function handleError(error, res) {
       responseBody,
       fallbackType: error.toAnthropicError().error?.type || 'api_error',
       retryAfterMs: error.retryAfterMs,
+      redactDetails: true,
     });
 
     if (resolved.retryAfterSeconds) {
@@ -580,7 +673,14 @@ function shouldStopOnToolUse(mcpPassthrough, hasTools, toolChoiceConfig, isStrea
   return isStreaming || toolChoiceConfig.disableParallelToolUse === true;
 }
 
-function mapErrorResponse({ statusCode, message, responseBody, fallbackType, retryAfterMs }) {
+function mapErrorResponse({
+  statusCode,
+  message,
+  responseBody,
+  fallbackType,
+  retryAfterMs,
+  redactDetails = false,
+}) {
   const errorText = extractErrorText(message, responseBody);
   const errorTextLower = errorText.toLowerCase();
   const retryAfterSeconds = retryAfterMs
@@ -592,7 +692,12 @@ function mapErrorResponse({ statusCode, message, responseBody, fallbackType, ret
     errorTextLower.includes('unauthorized') ||
     errorTextLower.includes('unauthenticated')
   ) {
-    return buildErrorResponse(401, 'authentication_error', errorText, retryAfterSeconds);
+    return buildErrorResponse(
+      401,
+      'authentication_error',
+      redactDetails ? 'Upstream authentication failed' : errorText,
+      retryAfterSeconds,
+    );
   }
 
   if (
@@ -600,21 +705,41 @@ function mapErrorResponse({ statusCode, message, responseBody, fallbackType, ret
     errorTextLower.includes('forbidden') ||
     errorTextLower.includes('permission')
   ) {
-    return buildErrorResponse(403, 'permission_error', errorText, retryAfterSeconds);
+    return buildErrorResponse(
+      403,
+      'permission_error',
+      redactDetails ? 'Upstream request was forbidden' : errorText,
+      retryAfterSeconds,
+    );
   }
 
   if (statusCode === 429 || isRateLimitMessage(errorTextLower)) {
-    return buildErrorResponse(429, 'rate_limit_error', errorText, retryAfterSeconds);
+    return buildErrorResponse(
+      429,
+      'rate_limit_error',
+      redactDetails ? 'Upstream rate limit exceeded' : errorText,
+      retryAfterSeconds,
+    );
   }
 
   if (statusCode === 400 || isInvalidRequestMessage(errorTextLower)) {
-    return buildErrorResponse(400, 'invalid_request_error', errorText, retryAfterSeconds);
+    return buildErrorResponse(
+      400,
+      'invalid_request_error',
+      redactDetails ? 'Upstream rejected the request' : errorText,
+      retryAfterSeconds,
+    );
   }
 
   const resolvedStatus = statusCode >= 400 && statusCode < 600 ? statusCode : 502;
   const resolvedType =
     fallbackType || (resolvedStatus >= 500 ? 'api_error' : 'invalid_request_error');
-  return buildErrorResponse(resolvedStatus, resolvedType, errorText, retryAfterSeconds);
+  return buildErrorResponse(
+    resolvedStatus,
+    resolvedType,
+    redactDetails ? 'Upstream HopGPT request failed' : errorText,
+    retryAfterSeconds,
+  );
 }
 
 function mapAuthErrorResponse(error) {
@@ -622,11 +747,24 @@ function mapAuthErrorResponse(error) {
 
   return mapErrorResponse({
     statusCode: errorMapping.statusCode,
-    message: error.message,
+    message: getPublicAuthErrorMessage(error),
     responseBody: '',
     fallbackType: errorMapping.errorType,
     retryAfterMs: null,
   });
+}
+
+function getPublicAuthErrorMessage(error) {
+  if (error instanceof RefreshTokenExpiredError || error instanceof TokenRefreshError) {
+    return 'HopGPT authentication expired; run bun run extract';
+  }
+  if (error instanceof CloudflareBlockedError) {
+    return 'HopGPT request was blocked by Cloudflare; refresh browser credentials';
+  }
+  if (error instanceof NetworkError) {
+    return 'Unable to reach HopGPT during authentication';
+  }
+  return 'HopGPT authentication failed';
 }
 
 function getAuthErrorMapping(error) {
@@ -761,4 +899,10 @@ function parseRetryAfterSeconds(text) {
   }
 
   return null;
+}
+
+function createTimeoutError(message) {
+  const error = new Error(message);
+  error.name = 'TimeoutError';
+  return error;
 }

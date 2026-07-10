@@ -101,7 +101,7 @@ router.post('/refresh-token', async (_req, res) => {
       success: false,
       error: {
         message:
-          'Missing refresh credential (HOPGPT_COOKIE_CONNECT_SID + HOPGPT_COOKIE_OPENID_USER_ID, or legacy HOPGPT_COOKIE_REFRESH_TOKEN). Run: npm run extract',
+          'Missing refresh credential (HOPGPT_COOKIE_CONNECT_SID + HOPGPT_COOKIE_OPENID_USER_ID, or legacy HOPGPT_COOKIE_REFRESH_TOKEN). Run: bun run extract',
       },
     });
   }
@@ -132,7 +132,7 @@ router.post('/refresh-token', async (_req, res) => {
         success: false,
         error: {
           type: errorType,
-          message: error.message,
+          message: publicAuthErrorMessage(error),
         },
       });
     }
@@ -142,7 +142,7 @@ router.post('/refresh-token', async (_req, res) => {
       success: false,
       error: {
         type: 'api_error',
-        message: error.message || 'Token refresh failed',
+        message: 'Token refresh failed',
       },
     });
   }
@@ -268,7 +268,7 @@ router.get('/token-debug', (_req, res) => {
   };
 
   if (!memoryRefreshCredentialPresent) {
-    debug.diagnosis.push('CRITICAL: No refresh credential in memory — run: npm run extract');
+    debug.diagnosis.push('CRITICAL: No refresh credential in memory — run: bun run extract');
   }
 
   if (!memoryOpenidId) {
@@ -276,7 +276,7 @@ router.get('/token-debug', (_req, res) => {
       'WARNING: No openid_user_id in memory; OpenID cookie context may be incomplete',
     );
   } else if (memoryOpenidInfo?.isExpired) {
-    debug.diagnosis.push('WARNING: openid_user_id is expired — run: npm run extract if auth fails');
+    debug.diagnosis.push('WARNING: openid_user_id is expired — run: bun run extract if auth fails');
   }
 
   if (!memorySid) {
@@ -321,4 +321,17 @@ function mapAuthErrorStatus(error) {
     return { statusCode: 502, errorType: 'api_error' };
   }
   return { statusCode: 500, errorType: 'api_error' };
+}
+
+function publicAuthErrorMessage(error) {
+  if (error instanceof RefreshTokenExpiredError || error instanceof TokenRefreshError) {
+    return 'HopGPT authentication expired; run bun run extract';
+  }
+  if (error instanceof CloudflareBlockedError) {
+    return 'HopGPT request was blocked by Cloudflare; refresh browser credentials';
+  }
+  if (error instanceof NetworkError) {
+    return 'Unable to reach HopGPT during token refresh';
+  }
+  return 'Token refresh failed';
 }

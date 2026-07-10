@@ -1,10 +1,11 @@
-import crypto from 'node:crypto';
-import { v4 as uuidv4 } from 'uuid';
+import { createHash, randomUUID } from 'node:crypto';
 import { loggers } from '../utils/logger.js';
 
 const log = loggers.session;
 const DEFAULT_TTL_MS = 6 * 60 * 60 * 1000;
 const DEFAULT_TRANSCRIPT_ALIASES_PER_SESSION = 32;
+const DEFAULT_MAX_SESSIONS = 1_000;
+const DEFAULT_MAX_STATE_VALUE_LENGTH = 262_144;
 
 const sessionStore = new Map();
 const transcriptIndex = new Map();
@@ -16,6 +17,15 @@ function normalizeId(value) {
   }
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : null;
+}
+
+function normalizeStateValue(value) {
+  const normalized = normalizeId(value);
+  if (!normalized) {
+    return null;
+  }
+  const maxLength = getMaxStateValueLength();
+  return normalized.length <= maxLength ? normalized : null;
 }
 
 function getTtlMs() {
@@ -30,6 +40,18 @@ function getTranscriptAliasesPerSessionLimit() {
   const isValidLimit = Number.isFinite(configured) && configured > 0;
 
   return isValidLimit ? configured : DEFAULT_TRANSCRIPT_ALIASES_PER_SESSION;
+}
+
+function getMaxSessions() {
+  const configured = Number.parseInt(process.env.HOPROXY_MAX_SESSIONS, 10);
+  return Number.isFinite(configured) && configured > 0 ? configured : DEFAULT_MAX_SESSIONS;
+}
+
+function getMaxStateValueLength() {
+  const configured = Number.parseInt(process.env.HOPROXY_MAX_STATE_VALUE_LENGTH, 10);
+  return Number.isFinite(configured) && configured > 0
+    ? configured
+    : DEFAULT_MAX_STATE_VALUE_LENGTH;
 }
 
 function cleanupExpiredSessions(now = Date.now()) {
@@ -47,29 +69,51 @@ function cleanupExpiredSessions(now = Date.now()) {
   }
 }
 
+function enforceSessionLimit() {
+  const maxSessions = getMaxSessions();
+  while (sessionStore.size > maxSessions) {
+    let oldestSessionId = null;
+    let oldestTouchedAt = Number.POSITIVE_INFINITY;
+    for (const [sessionId, entry] of sessionStore) {
+      if (entry.lastTouchedAt < oldestTouchedAt) {
+        oldestSessionId = sessionId;
+        oldestTouchedAt = entry.lastTouchedAt;
+      }
+    }
+    if (!oldestSessionId) {
+      break;
+    }
+    sessionStore.delete(oldestSessionId);
+    removeTranscriptAliasesForSession(oldestSessionId);
+  }
+}
+
+const cleanupTimer = setInterval(cleanupExpiredSessions, 60_000);
+cleanupTimer.unref?.();
+
 function removeTranscriptAliasesForSession(sessionId) {
   const aliases = transcriptAliasesBySession.get(sessionId);
   if (aliases) {
     for (const key of aliases) {
-      transcriptIndex.delete(key);
+      const sessions = transcriptIndex.get(key);
+      sessions?.delete(sessionId);
+      if (sessions?.size === 0) {
+        transcriptIndex.delete(key);
+      }
     }
     transcriptAliasesBySession.delete(sessionId);
     return;
   }
 
-  for (const [key, indexedSessionId] of transcriptIndex.entries()) {
-    if (indexedSessionId === sessionId) {
+  for (const [key, indexedSessionIds] of transcriptIndex.entries()) {
+    indexedSessionIds.delete(sessionId);
+    if (indexedSessionIds.size === 0) {
       transcriptIndex.delete(key);
     }
   }
 }
 
 function indexTranscriptAlias(sessionId, transcriptKey) {
-  const previousSessionId = transcriptIndex.get(transcriptKey);
-  if (previousSessionId && previousSessionId !== sessionId) {
-    transcriptAliasesBySession.get(previousSessionId)?.delete(transcriptKey);
-  }
-
   let aliases = transcriptAliasesBySession.get(sessionId);
   if (!aliases) {
     aliases = new Set();
@@ -80,13 +124,22 @@ function indexTranscriptAlias(sessionId, transcriptKey) {
     aliases.delete(transcriptKey);
   }
   aliases.add(transcriptKey);
-  transcriptIndex.set(transcriptKey, sessionId);
+  let indexedSessionIds = transcriptIndex.get(transcriptKey);
+  if (!indexedSessionIds) {
+    indexedSessionIds = new Set();
+    transcriptIndex.set(transcriptKey, indexedSessionIds);
+  }
+  indexedSessionIds.add(sessionId);
 
   const maxAliases = getTranscriptAliasesPerSessionLimit();
   while (aliases.size > maxAliases) {
     const oldestKey = aliases.values().next().value;
     aliases.delete(oldestKey);
-    transcriptIndex.delete(oldestKey);
+    const sessions = transcriptIndex.get(oldestKey);
+    sessions?.delete(sessionId);
+    if (sessions?.size === 0) {
+      transcriptIndex.delete(oldestKey);
+    }
   }
 }
 
@@ -221,7 +274,7 @@ function buildTranscriptKey(requestBody, messages) {
     system: normalizeSystemPrompt(requestBody?.system),
     messages: normalizedMessages,
   });
-  return crypto.createHash('sha256').update(JSON.stringify(payload)).digest('hex');
+  return createHash('sha256').update(JSON.stringify(payload)).digest('hex');
 }
 
 function buildContinuationLookupKey(requestBody) {
@@ -244,21 +297,54 @@ function buildContinuationLookupKey(requestBody) {
   return buildTranscriptKey(requestBody, prefixMessages);
 }
 
-function resolveSessionIdFromTranscript(requestBody) {
+function resolveClientNamespace(req) {
+  const explicitClientId = normalizeId(req.get('x-hoproxy-client-id'));
+  const source =
+    explicitClientId ||
+    [
+      req.ip || req.socket?.remoteAddress || 'local',
+      req.get('user-agent') || 'unknown-agent',
+      req.get('anthropic-version') || 'unknown-version',
+    ].join('|');
+  return createHash('sha256').update(source).digest('hex');
+}
+
+function namespacedTranscriptKey(clientNamespace, transcriptKey) {
+  return `${clientNamespace}:${transcriptKey}`;
+}
+
+function resolveSessionIdFromTranscript(requestBody, clientNamespace) {
   const transcriptKey = buildContinuationLookupKey(requestBody);
   if (!transcriptKey) {
     return null;
   }
 
   cleanupExpiredSessions();
-  const sessionId = transcriptIndex.get(transcriptKey);
-  if (!sessionId) {
+  const indexKey = namespacedTranscriptKey(clientNamespace, transcriptKey);
+  const legacyIndexKey = namespacedTranscriptKey('default', transcriptKey);
+  const resolvedIndexKey = transcriptIndex.has(indexKey) ? indexKey : legacyIndexKey;
+  const candidates = transcriptIndex.get(resolvedIndexKey);
+  if (!candidates) {
     return null;
   }
-  if (!sessionStore.has(sessionId)) {
-    transcriptIndex.delete(transcriptKey);
+
+  for (const sessionId of candidates) {
+    if (!sessionStore.has(sessionId)) {
+      candidates.delete(sessionId);
+    }
+  }
+  if (candidates.size === 0) {
+    transcriptIndex.delete(resolvedIndexKey);
     return null;
   }
+  if (candidates.size > 1) {
+    log.warn('Transcript matched multiple sessions; creating a new isolated session', {
+      matches: candidates.size,
+    });
+    return null;
+  }
+
+  const sessionId = candidates.values().next().value;
 
   log.debug('Using transcript-matched session ID', {
     sessionId: `${sessionId.slice(0, 8)}...`,
@@ -267,6 +353,7 @@ function resolveSessionIdFromTranscript(requestBody) {
 }
 
 export function resolveSessionId(req, requestBody, options = {}) {
+  const clientNamespace = resolveClientNamespace(req);
   const headerSessionId =
     normalizeId(req.get('x-session-id')) || normalizeId(req.get('x-sessionid'));
   const metadataSessionId = extractSessionIdFromMetadata(requestBody?.metadata);
@@ -274,19 +361,19 @@ export function resolveSessionId(req, requestBody, options = {}) {
 
   if (explicitSessionId) {
     log.debug('Using provided session ID', { sessionId: `${explicitSessionId.slice(0, 8)}...` });
-    return { sessionId: explicitSessionId, isGenerated: false };
+    return { sessionId: explicitSessionId, isGenerated: false, clientNamespace };
   }
 
   if (options.allowTranscriptMatch !== false) {
-    const transcriptSessionId = resolveSessionIdFromTranscript(requestBody);
+    const transcriptSessionId = resolveSessionIdFromTranscript(requestBody, clientNamespace);
     if (transcriptSessionId) {
-      return { sessionId: transcriptSessionId, isGenerated: false };
+      return { sessionId: transcriptSessionId, isGenerated: false, clientNamespace };
     }
   }
 
-  const newSessionId = uuidv4();
+  const newSessionId = randomUUID();
   log.debug('Generated new session ID', { sessionId: `${newSessionId.slice(0, 8)}...` });
-  return { sessionId: newSessionId, isGenerated: true };
+  return { sessionId: newSessionId, isGenerated: true, clientNamespace };
 }
 
 export function shouldResetConversation(req, requestBody) {
@@ -348,10 +435,10 @@ export function updateConversationState(sessionId, state) {
   const now = Date.now();
   const isNew = !sessionStore.has(normalizedSessionId);
   const entry = sessionStore.get(normalizedSessionId) || { createdAt: now };
-  const conversationId = normalizeId(state.conversationId);
-  const lastAssistantMessageId = normalizeId(state.lastAssistantMessageId);
-  const systemPrompt = normalizeId(state.systemPrompt);
-  const toolPromptHash = normalizeId(state.toolPromptHash);
+  const conversationId = normalizeStateValue(state.conversationId);
+  const lastAssistantMessageId = normalizeStateValue(state.lastAssistantMessageId);
+  const systemPrompt = normalizeStateValue(state.systemPrompt);
+  const toolPromptHash = normalizeStateValue(state.toolPromptHash);
 
   if (conversationId) {
     entry.conversationId = conversationId;
@@ -368,6 +455,7 @@ export function updateConversationState(sessionId, state) {
 
   entry.lastTouchedAt = now;
   sessionStore.set(normalizedSessionId, entry);
+  enforceSessionLimit();
 
   log.debug(isNew ? 'Created conversation state' : 'Updated conversation state', {
     sessionId: `${normalizedSessionId.slice(0, 8)}...`,
@@ -377,7 +465,12 @@ export function updateConversationState(sessionId, state) {
   });
 }
 
-export function rememberConversationTurn(sessionId, requestBody, assistantMessage) {
+export function rememberConversationTurn(
+  sessionId,
+  requestBody,
+  assistantMessage,
+  clientNamespace = 'default',
+) {
   const normalizedSessionId = normalizeId(sessionId);
   const requestMessages = requestBody?.messages;
   if (!normalizedSessionId || !Array.isArray(requestMessages) || !assistantMessage) {
@@ -390,7 +483,7 @@ export function rememberConversationTurn(sessionId, requestBody, assistantMessag
   }
 
   const normalizedAssistant = normalizeMessage(assistantMessage);
-  if (!normalizedAssistant || normalizedAssistant.role !== 'assistant') {
+  if (normalizedAssistant?.role !== 'assistant') {
     return;
   }
 
@@ -399,7 +492,10 @@ export function rememberConversationTurn(sessionId, requestBody, assistantMessag
     return;
   }
 
-  indexTranscriptAlias(normalizedSessionId, transcriptKey);
+  indexTranscriptAlias(
+    normalizedSessionId,
+    namespacedTranscriptKey(clientNamespace, transcriptKey),
+  );
   log.debug('Indexed transcript for session continuity', {
     sessionId: `${normalizedSessionId.slice(0, 8)}...`,
     transcriptAliases: transcriptIndex.size,
@@ -423,4 +519,9 @@ export function clearConversationStoreForTests() {
   sessionStore.clear();
   transcriptIndex.clear();
   transcriptAliasesBySession.clear();
+}
+
+export function getConversationStoreSize() {
+  cleanupExpiredSessions();
+  return sessionStore.size;
 }

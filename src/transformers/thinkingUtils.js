@@ -49,7 +49,7 @@ function sanitizeThinkingBlock(block) {
 }
 
 function restoreToolUseSignature(block) {
-  if (!block || block.type !== 'tool_use') {
+  if (block?.type !== 'tool_use') {
     return block;
   }
 

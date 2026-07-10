@@ -1,13 +1,13 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
 import 'dotenv/config';
 import fs from 'node:fs';
 import path from 'node:path';
-import express from 'express';
-import messagesRouter from './routes/messages.js';
-import modelsRouter from './routes/models.js';
-import refreshTokenRouter from './routes/refreshToken.js';
+import { createApp } from './app.js';
+import { loadConfig, validateRuntimeSecurity } from './config.js';
+import { abortActiveStreams } from './services/activeStreams.js';
 import { getDefaultClient, getTokenExpiryInfo } from './services/hopgptClient.js';
-import { createLogger, requestLoggerMiddleware } from './utils/logger.js';
+import { shutdownTLS } from './services/tlsClient.js';
+import { createLogger } from './utils/logger.js';
 
 const log = createLogger('Server');
 
@@ -56,7 +56,7 @@ function logStartupTokenDiagnostics() {
             : 'session',
     });
   } else {
-    log.error('Refresh credential: NOT SET — automatic refresh will fail (run: npm run extract)');
+    log.error('Refresh credential: NOT SET — automatic refresh will fail (run: bun run extract)');
   }
 
   if (refreshToken) {
@@ -80,12 +80,12 @@ function logStartupTokenDiagnostics() {
     });
     if (openidInfo?.isExpired) {
       log.warn(
-        'OpenID user cookie is expired — re-authentication may be required (run: npm run extract)',
+        'OpenID user cookie is expired — re-authentication may be required (run: bun run extract)',
       );
     }
   } else {
     log.warn(
-      'OpenID user cookie (openid_user_id): NOT SET — cookie context may be incomplete (run: npm run extract)',
+      'OpenID user cookie (openid_user_id): NOT SET — cookie context may be incomplete (run: bun run extract)',
     );
   }
 
@@ -96,7 +96,7 @@ function logStartupTokenDiagnostics() {
       length: sid.length,
     });
   } else {
-    log.warn('Session cookie (connect.sid): NOT SET — auth may be rejected (run: npm run extract)');
+    log.warn('Session cookie (connect.sid): NOT SET — auth may be rejected (run: bun run extract)');
   }
 
   try {
@@ -138,71 +138,50 @@ function logStartupTokenDiagnostics() {
   log.info('=== End Token Diagnostics ===');
 }
 
-const app = express();
-const PORT = process.env.PORT || 3001;
+export async function gracefulShutdown(server, signal = 'shutdown') {
+  log.info('Graceful shutdown started', { signal });
+  abortActiveStreams(new Error(`HoProxy received ${signal}`));
+  server.closeIdleConnections?.();
 
-app.use(express.json({ limit: '10mb' }));
-
-app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.header(
-    'Access-Control-Allow-Headers',
-    'Content-Type, Authorization, x-api-key, anthropic-version, x-session-id, x-sessionid, x-conversation-reset, x-mcp-passthrough',
-  );
-  res.header('Access-Control-Expose-Headers', 'x-session-id');
-
-  if (req.method === 'OPTIONS') {
-    return res.sendStatus(200);
-  }
-  next();
-});
-
-app.use(requestLoggerMiddleware());
-
-app.get('/health', (_req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
-});
-
-app.use('/v1', messagesRouter);
-app.use('/v1', modelsRouter);
-app.use(refreshTokenRouter);
-
-app.use((req, res) => {
-  res.status(404).json({
-    type: 'error',
-    error: {
-      type: 'not_found_error',
-      message: `Not found: ${req.method} ${req.path}`,
-    },
+  const closeServer = new Promise((resolve) => {
+    if (!server.listening) {
+      resolve();
+      return;
+    }
+    server.close(resolve);
   });
-});
-
-app.use((err, req, res, _next) => {
-  log.error('Unhandled error', {
-    requestId: req.id,
-    error: err.message,
-    stack: process.env.HOPGPT_DEBUG === 'true' ? err.stack : undefined,
+  const forceTimeout = new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      server.closeAllConnections?.();
+      resolve();
+    }, 10_000);
+    timer.unref?.();
   });
-  res.status(500).json({
-    type: 'error',
-    error: {
-      type: 'api_error',
-      message: 'Internal server error',
-    },
-  });
-});
 
-app.listen(PORT, () => {
-  log.info(`Server started on port ${PORT}`);
+  await Promise.race([closeServer, forceTimeout]);
+  await shutdownTLS();
+  log.info('Graceful shutdown complete');
+}
 
-  logStartupTokenDiagnostics();
+export function startServer({
+  config = loadConfig(),
+  diagnostics = true,
+  installSignalHandlers = true,
+} = {}) {
+  validateRuntimeSecurity(config);
+  const app = createApp({ config });
+  const server = app.listen(config.port, config.host, () => {
+    log.info('Server started', { host: config.host, port: config.port });
 
-  console.log(`
+    if (diagnostics) {
+      logStartupTokenDiagnostics();
+    }
+
+    console.log(`
 ╔════════════════════════════════════════════════════════════╗
 ║          HopGPT Anthropic API Proxy                        ║
 ╠════════════════════════════════════════════════════════════╣
-║  Server running on http://localhost:${PORT}                   ║
+║  Server running on http://${config.host}:${config.port}
 ║                                                            ║
 ║  Endpoints:                                                ║
 ║    POST /v1/messages  - Anthropic Messages API             ║
@@ -213,7 +192,35 @@ app.listen(PORT, () => {
 ║    GET  /health       - Health check                       ║
 ║                                                            ║
 ║  Usage with Anthropic SDK:                                 ║
-║    export ANTHROPIC_BASE_URL=http://localhost:${PORT}         ║
+║    export ANTHROPIC_BASE_URL=http://${config.host}:${config.port}
 ╚════════════════════════════════════════════════════════════╝
   `);
-});
+  });
+
+  if (installSignalHandlers) {
+    let shuttingDown = false;
+    const handleSignal = (signal) => {
+      if (shuttingDown) {
+        return;
+      }
+      shuttingDown = true;
+      void gracefulShutdown(server, signal).catch((error) => {
+        log.error('Graceful shutdown failed', { error: error.message });
+        process.exitCode = 1;
+      });
+    };
+    process.once('SIGINT', handleSignal);
+    process.once('SIGTERM', handleSignal);
+  }
+
+  return { app, server, config };
+}
+
+if (process.argv[1] && import.meta.url === new URL(process.argv[1], 'file:').href) {
+  try {
+    startServer();
+  } catch (error) {
+    log.error('HoProxy failed to start', { error: error.message });
+    process.exitCode = 1;
+  }
+}

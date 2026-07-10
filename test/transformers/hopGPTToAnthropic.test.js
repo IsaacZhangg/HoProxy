@@ -2837,7 +2837,7 @@ line3"}}
     expect(toolBlocks.length).toBe(0);
   });
 
-  it('preserves raw tool_use input when JSON parsing fails', () => {
+  it('repairs malformed tool_use input before schema handling', () => {
     const transformer = new HopGPTToAnthropicTransformer('claude-sonnet-4-5', {
       thinkingEnabled: false,
     });
@@ -2865,7 +2865,7 @@ line3"}}
 
     const response = transformer.buildNonStreamingResponse();
     const toolBlock = response.content.find((block) => block.type === 'tool_use');
-    expect(toolBlock.input).toEqual({ _raw: invalidInput });
+    expect(toolBlock.input).toEqual({ q: 'bad " quote' });
   });
 
   it('strips tool instruction leaks and role prefixes from final text', () => {

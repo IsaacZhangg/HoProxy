@@ -3,44 +3,62 @@
   "version": "1.0.0",
   "description": "Anthropic-compatible API proxy for HopGPT",
   "type": "module",
+  "packageManager": "bun@1.3.14",
   "main": "src/index.js",
   "bin": {
     "hopgpt-anthropic-proxy": "src/index.js"
   },
   "files": [
     "src",
-    "README.md"
+    "docs",
+    ".env.example",
+    "README.md",
+    "SECURITY.md"
   ],
   "publishConfig": {
     "access": "public"
   },
   "scripts": {
-    "start": "node src/index.js",
-    "dev": "node --watch src/index.js",
-    "extract": "node src/extract-credentials.js",
-    "lint": "biome lint .",
+    "start": "bun src/index.js",
+    "dev": "bun --watch src/index.js",
+    "extract": "bun src/extract-credentials.js",
+    "lint": "biome check .",
     "format": "biome format --write .",
     "format:check": "biome format .",
     "check": "biome check --write .",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "audit": "bun audit",
+    "pack:dry-run": "bun pm pack --dry-run"
   },
   "dependencies": {
-    "dotenv": "^16.3.1",
-    "eventsource-parser": "^1.1.1",
-    "express": "^4.18.2",
-    "node-tls-client": "^2.1.0",
-    "puppeteer": "^24.34.0",
+    "dotenv": "^17.4.2",
+    "eventsource-parser": "^3.1.0",
+    "express": "^5.2.1",
+    "node-tls-client": "^2.1.0"
+  },
+  "optionalDependencies": {
+    "puppeteer": "^25.3.0",
     "puppeteer-extra": "^3.3.6",
-    "puppeteer-extra-plugin-stealth": "^2.11.2",
-    "uuid": "^9.0.1"
+    "puppeteer-extra-plugin-stealth": "^2.11.2"
+  },
+  "overrides": {
+    "form-data": "4.0.6",
+    "minimatch": "3.1.4",
+    "picomatch": "4.0.4",
+    "piscina": "5.2.0",
+    "rollup": "4.59.0",
+    "vite": "8.1.4"
   },
   "devDependencies": {
-    "@biomejs/biome": "^2.4.14",
-    "supertest": "^7.1.4",
-    "vitest": "^3.2.4"
+    "@biomejs/biome": "^2.5.2",
+    "@vitest/coverage-v8": "^4.1.10",
+    "supertest": "^7.2.2",
+    "vitest": "^4.1.10"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "bun": ">=1.3.0",
+    "node": ">=20.0.0"
   }
 }

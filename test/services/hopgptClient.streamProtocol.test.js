@@ -79,11 +79,11 @@ describe('HopGPTClient.startStream', () => {
     expect(call.url).toBe('https://example.com/api/agents/chat/AnthropicClaude');
     expect(call.body).toEqual({ text: 'hello' });
     expect(call.headers['Content-Type']).toBe('application/json');
-    expect(call.headers['Accept']).toBe('application/json, text/plain, */*');
-    expect(call.headers['Origin']).toBe('https://example.com');
-    expect(call.headers['Referer']).toBe('https://example.com/c/new');
-    expect(call.headers['Authorization']).toBe('Bearer test-bearer');
-    expect(call.headers['Cookie']).toMatch(/openid_user_id=test-oid/);
+    expect(call.headers.Accept).toBe('application/json, text/plain, */*');
+    expect(call.headers.Origin).toBe('https://example.com');
+    expect(call.headers.Referer).toBe('https://example.com/c/new');
+    expect(call.headers.Authorization).toBe('Bearer test-bearer');
+    expect(call.headers.Cookie).toMatch(/openid_user_id=test-oid/);
   });
 
   it('throws HopGPTError(401) on 401 response', async () => {
@@ -245,37 +245,21 @@ describe('HopGPTClient.subscribeStream', () => {
     expect(new TextDecoder().decode(value)).toMatch(/final/);
   });
 
-  it('uses tlsFetch when streamingTransport is "tls"', async () => {
-    tlsFetchSpy.mockResolvedValue(
-      createMockTLSResponse({
-        ok: true,
-        status: 200,
-        body: 'event: message\ndata: {"final":true}\n\n',
-        headers: { 'content-type': 'text/event-stream' },
-      }),
-    );
+  it('rejects the deprecated buffered TLS streaming transport', async () => {
     const client = newClient({ streamingTransport: 'tls' });
-    const response = await client.subscribeStream('abc');
-    expect(tlsFetchSpy).toHaveBeenCalledTimes(1);
+    await expect(client.subscribeStream('abc')).rejects.toThrow(
+      /HOPGPT_STREAMING_TRANSPORT=tls is no longer supported/,
+    );
+    expect(tlsFetchSpy).not.toHaveBeenCalled();
     expect(fetchSpy).not.toHaveBeenCalled();
-    expect(response.ok).toBe(true);
   });
 
-  it('falls back to tlsFetch on generic fetch failure', async () => {
+  it('does not hide fetch failures behind buffered TLS fallback', async () => {
     fetchSpy.mockRejectedValue(new Error('ECONNRESET'));
-    tlsFetchSpy.mockResolvedValue(
-      createMockTLSResponse({
-        ok: true,
-        status: 200,
-        body: 'event: message\ndata: {"final":true}\n\n',
-        headers: { 'content-type': 'text/event-stream' },
-      }),
-    );
     const client = newClient();
-    const response = await client.subscribeStream('abc');
+    await expect(client.subscribeStream('abc')).rejects.toThrow('ECONNRESET');
     expect(fetchSpy).toHaveBeenCalledTimes(1);
-    expect(tlsFetchSpy).toHaveBeenCalledTimes(1);
-    expect(response.ok).toBe(true);
+    expect(tlsFetchSpy).not.toHaveBeenCalled();
   });
 
   it('rethrows AbortError from fetch without falling back to tlsFetch', async () => {
@@ -295,12 +279,12 @@ describe('HopGPTClient.subscribeStream', () => {
     const [url, init] = fetchSpy.mock.calls[0];
     expect(url).toBe('https://example.com/api/agents/chat/stream/xyz-789');
     expect(init.method).toBe('GET');
-    expect(init.headers['Accept']).toBe('*/*');
+    expect(init.headers.Accept).toBe('*/*');
     expect(init.headers['Cache-Control']).toBe('no-cache');
-    expect(init.headers['Pragma']).toBe('no-cache');
-    expect(init.headers['Referer']).toBe('https://example.com/c/new');
-    expect(init.headers['Authorization']).toBe('Bearer test-bearer');
-    expect(init.headers['Cookie']).toMatch(/openid_user_id=test-oid/);
+    expect(init.headers.Pragma).toBe('no-cache');
+    expect(init.headers.Referer).toBe('https://example.com/c/new');
+    expect(init.headers.Authorization).toBe('Bearer test-bearer');
+    expect(init.headers.Cookie).toMatch(/openid_user_id=test-oid/);
   });
 
   it('URL-encodes streamIds with reserved characters', async () => {

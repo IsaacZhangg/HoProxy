@@ -1,7 +1,25 @@
-import { v4 as uuidv4 } from 'uuid';
 import { loggers } from '../utils/logger.js';
-import { normalizeMaxTokens, normalizeStopSequences } from './anthropicToHopGPT.js';
+import {
+  isThinkingModel,
+  normalizeMaxTokens,
+  normalizeStopSequences,
+} from './sharedTransformUtils.js';
 import { cacheThinkingSignature, cacheToolSignature } from './signatureCache.js';
+import { createInitialStreamState } from './streamState.js';
+import {
+  findNextAssistantMarkerIndex,
+  findToolInstructionStartIndex,
+  sanitizeText as sanitizeTextFull,
+  stripRolePrefixes,
+} from './textSanitizer.js';
+import {
+  generateToolUseId,
+  normalizeToolNameToken,
+  parseStructuredToolCall,
+} from './toolCallParser.js';
+import { coerceAndValidateToolInput } from './toolInput.js';
+
+export { isThinkingModel } from './sharedTransformUtils.js';
 
 const log = loggers.transform;
 
@@ -67,15 +85,8 @@ const TOOL_CALL_BUFFER_WARN_STEP = parsePositiveInt(
 );
 
 const VALID_JSON_ESCAPES = new Set(['"', '\\', '/', 'b', 'f', 'n', 'r', 't', 'u']);
-const TOOL_INSTRUCTION_MARKERS = [
-  '# available tools',
-  '## tool definitions',
-  'you have access to the following tools',
-  'important: you must use this exact xml format to call tools',
-];
 const SANITIZE_TAIL_LENGTH = 120;
 const DUPLICATE_TEXT_CHUNK_MIN_LENGTH = 80;
-const ROLE_PREFIX_RE = /(^|\r?\n)\s*(?:H:|A:|Human:|Assistant:)\s*/g;
 
 function includesAny(haystack, needles) {
   return needles.some((tag) => haystack.includes(tag));
@@ -94,75 +105,6 @@ function isAssistantCreatedMessage(message) {
   const sender = typeof message.sender === 'string' ? message.sender.toLowerCase() : '';
   const role = typeof message.role === 'string' ? message.role.toLowerCase() : '';
   return ['assistant', 'claude', 'model'].includes(sender) || role === 'assistant';
-}
-
-function findToolInstructionStartIndex(text, fromIndex = 0) {
-  if (!text) {
-    return -1;
-  }
-  const lower = text.toLowerCase();
-  let earliest = -1;
-  for (const marker of TOOL_INSTRUCTION_MARKERS) {
-    const idx = lower.indexOf(marker, fromIndex);
-    if (idx !== -1 && (earliest === -1 || idx < earliest)) {
-      earliest = idx;
-    }
-  }
-  return earliest;
-}
-
-function findNextAssistantMarkerIndex(text, fromIndex = 0) {
-  if (!text) {
-    return -1;
-  }
-  const re = /(^|\r?\n)\s*(?:A:|Assistant:)\s*/g;
-  re.lastIndex = fromIndex;
-  const match = re.exec(text);
-  return match ? match.index : -1;
-}
-
-function stripRolePrefixes(text) {
-  if (!text) {
-    return text;
-  }
-  return text.replace(ROLE_PREFIX_RE, '$1');
-}
-
-function stripToolInstructionLeak(text) {
-  if (!text) {
-    return text;
-  }
-
-  let result = text;
-  while (true) {
-    const startIndex = findToolInstructionStartIndex(result, 0);
-    if (startIndex === -1) {
-      break;
-    }
-
-    const assistantIndex = findNextAssistantMarkerIndex(result, startIndex);
-    if (assistantIndex === -1) {
-      result = result.slice(0, startIndex);
-      break;
-    }
-
-    result = result.slice(0, startIndex) + result.slice(assistantIndex);
-  }
-
-  return result;
-}
-
-function sanitizeTextFull(text) {
-  return stripRolePrefixes(stripToolInstructionLeak(text));
-}
-
-function normalizeToolNameToken(value) {
-  if (!value || typeof value !== 'string') {
-    return '';
-  }
-  // Remove all non-alphanumeric characters for fuzzy matching
-  // This allows "todo_write" to match "todowrite"
-  return value.toLowerCase().replace(/[^a-z0-9]+/g, '');
 }
 
 function isLikelyToolTagStart(text, index, tagName) {
@@ -736,6 +678,11 @@ function parseJsonWithRepair(jsonText) {
 }
 
 function parseToolCallJsonContent(jsonContent) {
+  const structured = parseStructuredToolCall(jsonContent);
+  if (structured) {
+    return structured;
+  }
+
   const attemptParse = (value) => {
     const parsed = parseJsonWithRepair(value);
     if (!parsed || typeof parsed !== 'object') {
@@ -1603,8 +1550,7 @@ function splitTrailingAfterIncrementalToolCalls(text) {
 function splitOpenFunctionCallsRemainder(text) {
   const openingTag = findNextToolTag(text, 0);
   if (
-    !openingTag ||
-    openingTag.index !== 0 ||
+    openingTag?.index !== 0 ||
     openingTag.startTagEnd === -1 ||
     !isFunctionCallsTagName(openingTag.tagName)
   ) {
@@ -1704,8 +1650,7 @@ function consumeToolClosingPrefix(text, tagName) {
 function splitOpenJsonToolCallRemainder(text) {
   const openingTag = findNextToolTag(text, 0);
   if (
-    !openingTag ||
-    openingTag.index !== 0 ||
+    openingTag?.index !== 0 ||
     openingTag.startTagEnd === -1 ||
     (openingTag.tagName !== 'tool_call' && openingTag.tagName !== 'tool_use')
   ) {
@@ -1840,26 +1785,6 @@ function splitStreamTextForMcpToolCalls(text) {
   return { segments, remainder: '' };
 }
 
-export function isThinkingModel(model) {
-  if (!model) return false;
-  const modelLower = model.toLowerCase();
-  return (
-    modelLower.includes('-thinking') ||
-    modelLower.includes('thinking') ||
-    modelLower.includes('opus-4.5') ||
-    modelLower.includes('opus-4-5')
-  );
-}
-
-function generateToolUseId() {
-  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-  let result = 'toolu_01';
-  for (let i = 0; i < 22; i++) {
-    result += chars.charAt(Math.floor(Math.random() * chars.length));
-  }
-  return result;
-}
-
 function mapStopReason(value) {
   if (!value || typeof value !== 'string') {
     return null;
@@ -1901,33 +1826,17 @@ function mapStopReason(value) {
 
 export class HopGPTToAnthropicTransformer {
   constructor(model = 'claude-sonnet-4-20250514', options = {}) {
-    this.messageId = `msg_${uuidv4().replace(/-/g, '').slice(0, 24)}`;
+    Object.assign(
+      this,
+      createInitialStreamState({
+        warningThreshold: TOOL_CALL_BUFFER_WARN_THRESHOLD,
+      }),
+    );
     this.model = model;
-    this.hasStarted = false;
-    this.inputTokens = 0;
-    this.outputTokens = 0;
-    this.conversationId = null;
-    this.responseMessageId = null;
     this.systemPrompt = options.systemPrompt ?? null;
 
     this.thinkingEnabled = options.thinkingEnabled ?? isThinkingModel(model);
     this.suppressThinking = options.suppressThinking ?? false;
-    this.currentBlockIndex = -1;
-    this.currentBlockType = null;
-    this.blockStarted = false;
-    this.hasEmittedNonThinkingContent = false;
-
-    this.contentBlocks = [];
-    this.accumulatedText = '';
-    this.accumulatedThinking = '';
-    this.thinkingSignature = null;
-    this.mcpToolCallBuffer = '';
-    this._toolBufferWarningEmitted = false;
-    this._nextToolBufferWarningAt = TOOL_CALL_BUFFER_WARN_THRESHOLD;
-
-    this.currentToolUse = null;
-    this.accumulatedToolUses = [];
-    this.hasToolUse = false;
 
     // MCP tool call passthrough mode - when enabled, <mcp_tool_call> blocks are
     // passed through as text instead of being converted to tool_use blocks.
@@ -1969,18 +1878,9 @@ export class HopGPTToAnthropicTransformer {
 
     // Stop streaming once a tool_use is emitted (Anthropic tool-use behavior).
     this.stopOnToolUse = options.stopOnToolUse ?? false;
-    this._stopRequested = false;
-    this._suppressOutput = false;
-
-    this._textSanitizeBuffer = '';
-    this._toolLeakActive = false;
-    this._lastTextChunk = null;
-    this.suppressedThinkingText = '';
 
     this.maxTokens = normalizeMaxTokens(options.maxTokens);
     this.stopSequences = normalizeStopSequences(options.stopSequences);
-    this.hopGPTStopReason = null;
-    this.hopGPTStopSequence = null;
   }
 
   transformEvent(event) {
@@ -2349,12 +2249,10 @@ export class HopGPTToAnthropicTransformer {
 
         const sanitizedText = sanitizeTextFull(block.text || '');
         const segments = splitMcpToolCalls(sanitizedText, true);
-        const suppressToolPreamble =
-          this.suppressThinking && segments.some((segment) => segment.type === 'tool_call');
-        const suppressToolText =
-          suppressToolPreamble ||
-          (this.stopOnToolUse && segments.some((segment) => segment.type === 'tool_call'));
-        const hasToolCall = segments.some((segment) => segment.type === 'tool_call');
+        const containsToolCall = segments.some((segment) => segment.type === 'tool_call');
+        const suppressToolPreamble = this.suppressThinking && containsToolCall;
+        const suppressToolText = suppressToolPreamble || (this.stopOnToolUse && containsToolCall);
+        let hasToolCall = false;
         for (const segment of segments) {
           if (segment.type === 'text') {
             if (suppressToolText) {
@@ -2377,11 +2275,12 @@ export class HopGPTToAnthropicTransformer {
             continue;
           }
           if (segment.type === 'tool_call') {
-            this.hasToolUse = true;
             const toolBlock = this._buildToolUseFromCall(segment.toolCall);
             if (!toolBlock) {
               continue;
             }
+            this.hasToolUse = true;
+            hasToolCall = true;
             this.contentBlocks.push({
               type: 'tool_use',
               id: toolBlock.id,
@@ -2394,23 +2293,20 @@ export class HopGPTToAnthropicTransformer {
           stopAfterTool = true;
         }
       } else if (block.type === 'tool_use') {
-        this.hasToolUse = true;
-        let input = block.input;
-
-        if (typeof input === 'string') {
-          try {
-            input = JSON.parse(input);
-          } catch (_e) {
-            input = { _raw: input };
-          }
+        const toolBlock = this._buildToolUseFromCall({
+          toolName: block.name,
+          arguments: block.input ?? {},
+          toolUseId: block.id,
+        });
+        if (!toolBlock) {
+          continue;
         }
-        input = normalizeToolInput(input);
-
+        this.hasToolUse = true;
         this.contentBlocks.push({
           type: 'tool_use',
-          id: block.id || generateToolUseId(),
-          name: block.name || '',
-          input: input || {},
+          id: toolBlock.id,
+          name: toolBlock.name,
+          input: toolBlock.input,
         });
         const nextBlock = content[index + 1];
         if (this.stopOnToolUse && nextBlock?.type !== 'tool_use') {
@@ -2746,6 +2642,32 @@ export class HopGPTToAnthropicTransformer {
   }
 
   _processToolUseBlock(block) {
+    if (this.availableToolNames.length > 0) {
+      const declaredName = this._lookupToolName(block.name);
+      if (!declaredName) {
+        log.warn('Rejected undeclared tool_use block', { toolName: block.name });
+        return [];
+      }
+      if (block.input !== undefined) {
+        const rawInput =
+          typeof block.input === 'string'
+            ? (parseJsonWithRepair(block.input) ?? { _raw: block.input })
+            : block.input;
+        const validation = coerceAndValidateToolInput(
+          normalizeToolInput(rawInput ?? {}),
+          this.availableToolSchemaMap.get(declaredName),
+        );
+        if (!validation.valid) {
+          log.warn('Rejected tool_use block with invalid input', {
+            toolName: declaredName,
+            error: validation.error,
+          });
+          return [];
+        }
+        block = { ...block, name: declaredName, input: validation.input };
+      }
+    }
+
     const events = [];
     this.hasToolUse = true;
     this.hasEmittedNonThinkingContent = true;
@@ -3296,6 +3218,11 @@ export class HopGPTToAnthropicTransformer {
       }
     }
 
+    if (this.availableToolNames.length > 0 && !this.availableToolNameSet.has(resolvedName)) {
+      log.warn('Rejected undeclared tool call', { toolName: resolvedName });
+      return null;
+    }
+
     return {
       name: resolvedName,
       input: resolvedInput,
@@ -3309,12 +3236,26 @@ export class HopGPTToAnthropicTransformer {
       return null;
     }
     const schema = this.availableToolSchemaMap.get(resolved.name);
-    const input = coerceToolArgumentsForSchema(resolved.input, schema);
+    const resolvedInput =
+      typeof resolved.input === 'string'
+        ? (parseJsonWithRepair(resolved.input) ?? { _raw: resolved.input })
+        : resolved.input;
+    const normalizedInput = normalizeToolInput(
+      coerceToolArgumentsForSchema(resolvedInput ?? {}, schema),
+    );
+    const validation = coerceAndValidateToolInput(normalizedInput, schema);
+    if (!validation.valid) {
+      log.warn('Rejected tool call with invalid input', {
+        toolName: resolved.name,
+        error: validation.error,
+      });
+      return null;
+    }
     return {
       type: 'tool_use',
       id: resolved.toolUseId || generateToolUseId(),
       name: resolved.name,
-      input: normalizeToolInput(input),
+      input: validation.input,
     };
   }
 

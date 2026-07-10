@@ -1,6 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   clearConversationStoreForTests,
+  getConversationState,
+  getConversationStoreSize,
   rememberConversationTurn,
   resolveSessionId,
   updateConversationState,
@@ -21,10 +23,12 @@ describe('conversationStore', () => {
   beforeEach(() => {
     clearConversationStoreForTests();
     delete process.env.TRANSCRIPT_ALIASES_PER_SESSION;
+    delete process.env.HOPROXY_MAX_SESSIONS;
   });
 
   afterEach(() => {
     delete process.env.TRANSCRIPT_ALIASES_PER_SESSION;
+    delete process.env.HOPROXY_MAX_SESSIONS;
   });
 
   it('keeps transcript matching scoped to the request model', () => {
@@ -116,5 +120,43 @@ describe('conversationStore', () => {
     expect(trimmedAlias.sessionId).not.toBe(sessionId);
     expect(trimmedAlias.isGenerated).toBe(true);
     expect(retainedAlias.sessionId).toBe(sessionId);
+  });
+
+  it('namespaces transcript fallback by client identity', () => {
+    const firstRequest = createRequest('claude-sonnet-4-5', [{ role: 'user', content: 'Hello' }]);
+    const clientRequest = (clientId) => ({
+      get: (name) => (name === 'x-hoproxy-client-id' ? clientId : null),
+    });
+
+    const first = resolveSessionId(clientRequest('client-a'), firstRequest);
+    updateConversationState(first.sessionId, { conversationId: 'conv-a' });
+    rememberConversationTurn(
+      first.sessionId,
+      firstRequest,
+      { role: 'assistant', content: 'Hi' },
+      first.clientNamespace,
+    );
+
+    const continuation = createRequest('claude-sonnet-4-5', [
+      { role: 'user', content: 'Hello' },
+      { role: 'assistant', content: 'Hi' },
+      { role: 'user', content: 'Continue' },
+    ]);
+    expect(resolveSessionId(clientRequest('client-a'), continuation).sessionId).toBe(
+      first.sessionId,
+    );
+    expect(resolveSessionId(clientRequest('client-b'), continuation).sessionId).not.toBe(
+      first.sessionId,
+    );
+  });
+
+  it('evicts least-recently-used sessions at the configured cap', () => {
+    process.env.HOPROXY_MAX_SESSIONS = '2';
+    updateConversationState('one', { conversationId: 'conv-1' });
+    updateConversationState('two', { conversationId: 'conv-2' });
+    updateConversationState('three', { conversationId: 'conv-3' });
+
+    expect(getConversationStoreSize()).toBe(2);
+    expect(getConversationState('one')).toBeNull();
   });
 });

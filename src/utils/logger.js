@@ -89,10 +89,22 @@ function safeStringify(obj, maxLen = 500) {
 
   try {
     const str = JSON.stringify(obj, (key, value) => {
+      const normalizedKey = key.toLowerCase();
       if (
         ['token', 'bearer', 'cookie', 'authorization', 'password', 'secret'].some((k) =>
-          key.toLowerCase().includes(k),
-        )
+          normalizedKey.includes(k),
+        ) ||
+        [
+          'arguments',
+          'body',
+          'content',
+          'input',
+          'messages',
+          'prompt',
+          'responsebody',
+          'system',
+          'upstreambody',
+        ].includes(normalizedKey)
       ) {
         return '[REDACTED]';
       }
